@@ -112,7 +112,7 @@ def main():
     keyword_input = st.text_input("Enter Keywords (comma-separated):", value=default_keyword_value)
     keywords = [kw.strip().lower() for kw in keyword_input.split(',') if kw.strip()]
 
-    depth = st.slider("Select Tree Depth (Exponential):", 1, 4, 4)
+    depth = st.slider("Select Tree Depth (Exponential):", 1, 4, 2)
 
     if st.button("Start Scraping"):
         formatted_query = format_search_query(SearchQueryVal)
