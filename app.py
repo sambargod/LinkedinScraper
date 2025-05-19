@@ -1,48 +1,68 @@
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
-import textwrap
 import pandas as pd
 import webbrowser
+from datetime import datetime
+import json
+from pyvis.network import Network
+import networkx as nx
+import streamlit.components.v1 as components
+import warnings
+from collections import Counter
+import re
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+import nltk
+from nltk.corpus import stopwords
+nltk.download('stopwords')
 
-class WikiWebber:
-    def wrap_text(self, input_text, width=10):
-        return textwrap.fill(input_text, width)
+# Suppress warnings
+warnings.filterwarnings("ignore")
 
-    def get_links_from_body(self, url=None):
-        list_links = []
-        if not url:
-            return list_links
-        try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                body = soup.body
-                if body:
-                    links = body.find_all('a')
-                    for link in links:
-                        href = link.get('href')
-                        heading = link.text
-                        if href:
-                            list_links.append((href, heading))
-        except Exception as e:
-            st.error(f"Error fetching {url}: {e}")
-        return list_links
-
-def vlink(link, keywords):
-    return any(x in link for x in keywords)
-
+# ---------- Helper Functions ----------
 def format_search_query(SQ):
     return SQ.replace(" ", "%20")
 
-def link_metadata_remover(link):
-    return link.split('?')[0]
+def get_links_from_body(url):
+    list_links = []
+    try:
+        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            body = soup.body
+            if body:
+                links = body.find_all('a')
+                for link in links:
+                    href = link.get('href')
+                    heading = link.text
+                    if href:
+                        list_links.append((href, heading))
+    except Exception as e:
+        st.error(f"Error fetching {url}: {e}")
+    return list_links
 
-def check_keywords(keywords, val):
-    return any(x in val.lower() for x in keywords)
+def get_job_details(job_url):
+    description = ""
+    posting_age = ""
+    try:
+        response = requests.get(job_url, headers={'User-Agent': 'Mozilla/5.0'})
+        soup = BeautifulSoup(response.text, 'html.parser')
+        script_tag = soup.find('script', type='application/ld+json')
+        if script_tag:
+            data = json.loads(script_tag.string)
+            description = data.get('description', '').strip()
+            date_posted = data.get('datePosted', '')
+            if date_posted:
+                date_posted = date_posted.split('T')[0]  # Remove time component
+                posted_date = datetime.strptime(date_posted, '%Y-%m-%d')
+                posting_age = f"{(datetime.now() - posted_date).days} days ago"
+    except Exception:
+        pass  # Silently skip failed descriptions
+    return description, posting_age
 
 def save_csv(df, name):
-    name = name.replace('\n', '').strip().replace(" ", "_")
+    name = name.replace("\n", '').strip().replace(" ", "_")
     filepath = f"{name}.csv"
     df.to_csv(filepath, index=False)
     st.success(f"Saved CSV as {filepath}")
@@ -51,95 +71,115 @@ def open_all_links(df):
     for url in df["Link"].to_numpy():
         webbrowser.open_new_tab(url)
 
+def analyze_descriptions(descriptions, user_keywords):
+    stop_words = set(stopwords.words('english'))
+    all_words = re.findall(r'\b\w+\b', ' '.join(descriptions).lower())
+    filtered_words = [word for word in all_words if word not in stop_words and len(word) > 2]
+    common_words = Counter(filtered_words).most_common(10)
+
+    keyword_freq = {kw: 0 for kw in user_keywords}
+    for word in all_words:
+        if word in keyword_freq:
+            keyword_freq[word] += 1
+
+    st.subheader("🔍 Keyword Analysis")
+    st.write("**Most common overlapping words in job descriptions (excluding stopwords):**")
+    for word, freq in common_words:
+        st.write(f"- {word}: {freq} times")
+
+    st.write("\n**Frequency of your searched keywords in job descriptions:**")
+    for kw, freq in keyword_freq.items():
+        st.write(f"- {kw}: {freq} times")
+
+    # WordCloud
+    st.write("\n**Word Cloud:**")
+    wordcloud = WordCloud(width=800, height=400, background_color='white').generate(' '.join(filtered_words))
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.imshow(wordcloud, interpolation='bilinear')
+    ax.axis('off')
+    st.pyplot(fig)
+
+# ---------- Main App ----------
 def main():
-    st.set_page_config(page_title="LinkedIn Job Scraper", layout="wide")
-    st.title("LinkedIn Job Scraper")
+    st.set_page_config(page_title="LinkedIn Job Scraper with Graph", layout="wide")
+    st.title("LinkedIn Job Scraper + Network Graph")
 
     SearchQueryVal = st.text_input("Enter Search Query:", "")
     if not SearchQueryVal:
         st.stop()
 
     default_keyword_value = ",".join(SearchQueryVal.split())
-    keywords_input = st.text_input("Enter Keywords (comma separated):", value=default_keyword_value)
-    keywords = [kw.strip().lower() for kw in keywords_input.split(',') if kw.strip()]
+    keyword_input = st.text_input("Enter Keywords (comma-separated):", value=default_keyword_value)
+    keywords = [kw.strip().lower() for kw in keyword_input.split(',') if kw.strip()]
 
-    depth = st.slider("Select Tree Depth (Exponential Complexity):", min_value=1, max_value=4, value=2)
+    depth = st.slider("Select Tree Depth (Exponential):", 1, 4, 4)
 
     if st.button("Start Scraping"):
-        W = WikiWebber()
-        SearchQuery = format_search_query(SearchQueryVal)
-        TRIES = 5
-        current_try = 1
+        formatted_query = format_search_query(SearchQueryVal)
+        ROOT = [f"https://www.linkedin.com/jobs/search/?keywords={formatted_query}&location=India&origin=JOB_SEARCH_PAGE_SEARCH_BUTTON"]
         all_links = []
-        progress_text = st.empty()
-        depth_bar = st.progress(0)
+        edges = []
+        seen_urls = set()
 
-        # Scrollable container using HTML & Markdown
         scroll_container = st.empty()
-        scroll_content = ""
+        scroll_html = ""
 
-        result_table = st.empty()
+        st.info("Scraping in progress...")
+        progress = st.progress(0)
 
-        with st.spinner("Scraping..."):
-            while True:
-                ROOT = [
-                    f"https://www.linkedin.com/jobs/search/?keywords={SearchQuery}&location=India&origin=JOB_SEARCH_PAGE_SEARCH_BUTTON"
-                ]
-                v_links = []
+        for d in range(depth):
+            new_root = []
+            for i, url in enumerate(ROOT):
+                links = get_links_from_body(url)
+                for link, title in links:
+                    if 'linkedin.com/jobs/view' in link and any(k in link.lower() for k in keywords):
+                        clean_url = link.split('?')[0]
+                        if clean_url not in seen_urls:
+                            seen_urls.add(clean_url)
+                            description, age = get_job_details(clean_url)
+                            cropped_desc = (description[:100] + '...') if len(description) > 100 else description
+                            all_links.append((f'<a href="{clean_url}" target="_blank">{title.strip()}</a>', clean_url, cropped_desc, age))
+                            edges.append((url, clean_url))
+                            scroll_html += f'<a href="{clean_url}" target="_blank">{title.strip()}</a><br>'
+                            styled_html = f"""
+                            <div style='height:300px; overflow-y:auto; padding:10px; border:1px solid #ccc; background:#f9f9f9;'>
+                                {scroll_html}
+                            </div>
+                            """
+                            scroll_container.markdown(styled_html, unsafe_allow_html=True)
+                        new_root.append(clean_url)
+                progress.progress((d + 1) / depth)
+            ROOT = new_root
 
-                for depth_index in range(depth):
-                    T_ROOT = []
-                    progress_text.text(f"Depth {depth_index + 1}/{depth}")
-                    for i, L in enumerate(ROOT):
-                        links = W.get_links_from_body(L)
-                        for x, h in links:
-                            if (('linkedin.com/jobs/' in x) or ('in.linkedin.com/jobs/' in x)) and vlink(x, keywords):
-                                T_ROOT.append(x)
-                                if 'linkedin.com/jobs/view' in x:
-                                    x = link_metadata_remover(x)
-                                    if check_keywords(keywords, h):
-                                        clean_heading = h.replace('\n', '').strip()
-                                        v_links.append((x, clean_heading))
+        df = pd.DataFrame(all_links, columns=["Title", "Link", "Description", "Posting Age"])
 
-                                        # Append to scrollable section
-                                        scroll_content += f'<a href="{x}" target="_blank">{clean_heading}</a><br>'
-                                        styled_scroll = f"""
-                                        <div style="height:300px; overflow-y:auto; padding:10px; border:1px solid #ccc; background:#f9f9f9;">
-                                        {scroll_content}
-                                        </div>
-                                        """
-                                        scroll_container.markdown(styled_scroll, unsafe_allow_html=True)
+        st.subheader("Results")
+        st.write("Clickable job titles with links:")
+        st.write(df.to_html(escape=False, index=False), unsafe_allow_html=True)
 
-                        if len(ROOT) > 1:
-                            percent_in_depth = (i + 1) / len(ROOT)
-                            depth_bar.progress(min((depth_index + percent_in_depth) / depth, 1.0))
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Save to CSV"):
+                save_csv(df, SearchQueryVal)
+        with col2:
+            if st.button("Open All Links"):
+                open_all_links(df)
 
-                    all_links += v_links
-                    ROOT = T_ROOT
+        st.subheader("Job Network Graph")
+        G = nx.DiGraph()
+        for src, tgt in edges:
+            G.add_edge(src, tgt)
 
-                if all_links or current_try == TRIES:
-                    break
-                current_try += 1
+        net = Network(height='600px', width='100%', directed=True)
+        net.from_nx(G)
+        net.show_buttons(filter_=['physics'])
+        net.save_graph('job_graph.html')
+        with open("job_graph.html", "r", encoding="utf-8") as f:
+            graph_html = f.read()
+        components.html(graph_html, height=600, scrolling=True)
 
-        if all_links:
-            df = pd.DataFrame(all_links, columns=["Link", "Name"])
-            df = df.drop_duplicates()
-            df = df[["Name", "Link"]]  # reorder
-
-            st.success(f"✅ Found {len(df)} job listings!")
-            result_table.dataframe(df, use_container_width=True)
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                if st.button("Save to CSV"):
-                    save_csv(df, SearchQueryVal)
-            with col2:
-                if st.button("Open All Links"):
-                    open_all_links(df)
-            with col3:
-                st.button("New Search", on_click=lambda: st.experimental_rerun())
-        else:
-            st.warning("No valid job links found.")
+        # Run analysis on descriptions
+        analyze_descriptions(df['Description'].tolist(), keywords)
 
 if __name__ == "__main__":
     main()

@@ -2,3 +2,8 @@ streamlit
 requests
 beautifulsoup4
 pandas
+pyvis
+networkx
+wordcloud
+matplotlib
+nltk
